@@ -1,0 +1,628 @@
+import datetime as dt
+import time
+import logging
+import numpy as np
+from time import sleep 
+import requests
+
+from optibook.synchronous_client import Exchange
+from optibook.common_types import InstrumentType, OptionKind
+
+from math import floor, ceil, exp
+from black_scholes import call_value, put_value, call_delta, put_delta
+from libs import calculate_current_time_to_date
+
+exchange = Exchange()
+exchange.connect()
+logging.getLogger('client').setLevel('ERROR')
+
+
+def round_down_to_tick(price, tick_size):
+    """
+    Rounds a price down to the nearest tick, e.g. if the tick size is 0.10, a price of 0.97 will get rounded to 0.90.
+    """
+    return floor(price / tick_size) * tick_size
+
+
+def round_up_to_tick(price, tick_size):
+    """
+    Rounds a price up to the nearest tick, e.g. if the tick size is 0.10, a price of 1.34 will get rounded to 1.40.
+    """
+    return ceil(price / tick_size) * tick_size
+
+
+def get_midpoint_value(instrument_id, spread):
+    """
+    This function calculates the current midpoint of the order book supplied by the exchange for the instrument
+    specified by <instrument_id>, returning None if either side or both sides do not have any orders available. T
+    his funtion is also called recursively until a liquid order book is found. 
+    """
+    order_book = exchange.get_last_price_book(instrument_id=instrument_id)
+
+    # If the instrument doesn't have prices at all or on either side, we cannot calculate a midpoint and return None
+    if not (order_book and order_book.bids and order_book.asks):
+        return None
+    elif order_book.asks[0].price - order_book.bids[0].price > spread:
+        sleep(0.2) #wait 0.15 seconds to let order book becomes liquid
+        return get_midpoint_value(instrument_id, spread) #recursively call this funtion until liquid mid price is found.
+    else:
+        midpoint = (order_book.bids[0].price + order_book.asks[0].price) / 2.0
+        return midpoint
+
+def get_midpoint_value_normal(instrument_id):
+    """
+    This function calculates the current midpoint of the order book supplied by the exchange for the instrument
+    specified by <instrument_id>, returning None if either side or both sides do not have any orders available. T
+    his funtion is also called recursively until a liquid order book is found. 
+    """
+    order_book = exchange.get_last_price_book(instrument_id=instrument_id)
+
+    # If the instrument doesn't have prices at all or on either side, we cannot calculate a midpoint and return None
+    if not (order_book and order_book.bids and order_book.asks):
+        return None
+    else:
+        midpoint = (order_book.bids[0].price + order_book.asks[0].price) / 2.0
+        return midpoint   
+
+        
+def downloadOrderBook(instr):
+    book = exchange.get_last_price_book(instr)
+    return book.bids, book.asks
+
+def best_ask_bid_price(instr, method = "both"):
+    try:
+        bids, asks = downloadOrderBook(instr)
+        if method == "both": #avoid TypeError: 'NoneType' object is not iterable
+        
+            return bids[0].price, asks[0].price
+            
+        elif method == "bid":
+            return bids[0].price
+            
+        else:
+            return asks[0].price
+
+        
+    except IndexError:
+        sleep(0.10)
+        best_ask_bid_price(instr, method=method) #recursively call the funtion until a price is found
+    
+    except TypeError:
+        sleep(0.10)
+        best_ask_bid_price(instr, method=method) #recursively call the funtion until a price is found
+
+
+def calculate_theoretical_option_value(expiry, strike, option_kind, stock_value, interest_rate, volatility):
+    """
+    This function calculates the current fair call or put value based on Black & Scholes assumptions.
+
+    expiry: dt.date          -  Expiry date of the option
+    strike: float            -  Strike price of the option
+    option_kind: OptionKind  -  Type of the option
+    stock_value:             -  Assumed stock value when calculating the Black-Scholes value
+    interest_rate:           -  Assumed interest rate when calculating the Black-Scholes value
+    volatility:              -  Assumed volatility of when calculating the Black-Scholes value
+    """
+    time_to_expiry = calculate_current_time_to_date(expiry)
+
+    if option_kind == OptionKind.CALL:
+        option_value = call_value(S=stock_value, K=strike, T=time_to_expiry, r=interest_rate, sigma=volatility)
+    elif option_kind == OptionKind.PUT:
+        option_value = put_value(S=stock_value, K=strike, T=time_to_expiry, r=interest_rate, sigma=volatility)
+
+    return option_value
+    
+def calculate_future_discount(expiry, interest_rate):
+    time_to_expiry = calculate_current_time_to_date(expiry)
+    return exp(time_to_expiry * interest_rate)
+
+def calculate_theoretical_future_value(expiry, stock_value, interest_rate):
+    """
+    This function calculates the current fair future value through discounting
+
+    expiry: dt.date          -  Expiry date of the option
+    stock_value:             -  Assumed stock value 
+    interest_rate:           -  Assumed interest rate
+    """
+    future_value = stock_value*calculate_future_discount(expiry, interest_rate)
+    return future_value
+    
+def calculate_option_delta(expiry_date, strike, option_kind, stock_value, interest_rate, volatility):
+    """
+    This function calculates the current option delta based on Black & Scholes assumptions.
+
+    expiry_date: dt.date     -  Expiry date of the option
+    strike: float            -  Strike price of the option
+    option_kind: OptionKind  -  Type of the option
+    stock_value:             -  Assumed stock value when calculating the Black-Scholes value
+    interest_rate:           -  Assumed interest rate when calculating the Black-Scholes value
+    volatility:              -  Assumed volatility of when calculating the Black-Scholes value
+    """
+    time_to_expiry = calculate_current_time_to_date(expiry_date)
+
+    if option_kind == OptionKind.CALL:
+        option_delta = call_delta(S=stock_value, K=strike, T=time_to_expiry, r=interest_rate, sigma=volatility)
+    elif option_kind == OptionKind.PUT:
+        option_delta = put_delta(S=stock_value, K=strike, T=time_to_expiry, r=interest_rate, sigma=volatility)
+    else:
+        raise Exception(f"""Got unexpected value for option_kind argument, should be OptionKind.CALL or OptionKind.PUT but was {option_kind}.""")
+
+    return option_delta
+    
+
+def dynamic_limit_position(instrument_id, volume, position_limit=100):
+    position = exchange.get_positions()[instrument_id]
+
+    max_volume_to_buy = position_limit - position
+    max_volume_to_sell = position_limit + position
+
+    bid_volume = min(volume, max_volume_to_buy)
+    ask_volume = min(volume, max_volume_to_sell)
+    return bid_volume, ask_volume
+
+def dynamic_bid_ask_tag(instument_id, best_bid, best_ask, theoretical_price, pillow, tick_size, max_position):
+    position = exchange.get_positions()[instument_id]
+    
+    if abs(position) != max_position:
+        if best_bid + pillow < theoretical_price and best_ask - pillow > theoretical_price: #Dynamic position
+            bid_price = best_bid + tick_size
+            ask_price = best_ask - tick_size
+            
+        
+        else: #static position
+            bid_price = round_down_to_tick(theoretical_price - pillow, tick_size)
+            ask_price = round_up_to_tick(theoretical_price + pillow, tick_size)
+            
+    else: #competetive position to unwind the hedge position
+        bid_price = best_bid + tick_size
+        ask_price = best_ask - tick_size
+        
+    return bid_price, ask_price
+        
+    
+def dynamic_volume(position, threshold, high_vol, low_vol):
+    #position = exchange.get_positions()[instument_id]
+    
+    if abs(position) < threshold:
+        return low_vol
+        
+    else:
+        return high_vol
+        
+        
+def update_quotes(option_id, theoretical_price, volume, pillow, direction= "both", position_limit=100, tick_size=0.1):
+    """
+    This function updates the quotes specified by <option_id>. We take the following actions in sequence:
+        - pull (remove) any current oustanding orders
+        - add credit to theoretical price and round to nearest tick size to create a set of bid/ask quotes
+        - calculate max volumes to insert as to not pass the position_limit
+        - reinsert limit orders on those levels
+
+    Arguments:
+        option_id: str           -  Exchange Instrument ID of the option to trade
+        theoretical_price: float -  Price to quote around
+        pillow: float            -  Difference to subtract from/add to theoretical price to come to final bid/ask price
+        volume:                  -  Volume (# lots) of the inserted orders (given they do not breach position limits)
+        position_limit: int      -  Position limit (long/short) to avoid crossing
+        tick_size: float         -  Tick size of the quoted instrument
+    """
+    
+    # Print any new trades
+    trades = exchange.poll_new_trades(instrument_id=option_id)
+    
+    for trade in trades:
+        print(f'- Last period, traded {trade.volume} lots in {option_id} at price {trade.price:.2f}, side {trade.side}.')
+
+    # Pull (remove) all existing outstanding orders
+    orders = exchange.get_outstanding_orders(instrument_id=option_id)
+    for order_id, order in orders.items():
+        print(f'- Deleting old {order.side} order in {option_id} for {order.volume} @ {order.price:8.2f}.')
+        exchange.delete_order(instrument_id=option_id, order_id=order_id)
+
+    # Calculate bid and ask price
+    best_bid, best_ask = best_ask_bid_price(option_id)
+    print(f'best bid {best_bid}, best ask: {best_ask} for {option_id}')
+    
+    #changing bid and ask position depending on the dynamic of the order book. Maximise profit opprtunity if exits while being conservative when it isnt. 
+    bid_price, ask_price = dynamic_bid_ask_tag(option_id, 
+                                                best_bid=best_bid, 
+                                                best_ask=best_ask, 
+                                                theoretical_price=theoretical_price,
+                                                pillow=pillow, 
+                                                tick_size=tick_size, 
+                                                max_position=position_limit)
+    
+    # Calculate bid and ask volumes, taking into account the provided position_limil
+    bid_volume, ask_volume = dynamic_limit_position(option_id, volume)
+    
+    #switch to turn on and off limit order
+    if direction == "buy":
+        buy_activate = True
+        sell_activate = False
+    elif direction == "sell":
+        sell_activate = True
+        buy_activate = False
+    else:
+        buy_activate = True
+        sell_activate = True
+
+    # Insert new limit orders
+    if bid_volume > 0 and buy_activate:
+        print(f'- Inserting bid limit order in {option_id} for {bid_volume} @ {bid_price:8.2f}.')
+        exchange.insert_order(
+            instrument_id=option_id,
+            price=bid_price,
+            volume=bid_volume,
+            side='bid',
+            order_type='limit',
+        )
+        
+    if ask_volume > 0 and sell_activate:
+        print(f'- Inserting ask limit order in {option_id} for {ask_volume} @ {ask_price:8.2f}.')
+        exchange.insert_order(
+            instrument_id=option_id,
+            price=ask_price,
+            volume=ask_volume,
+            side='ask',
+            order_type='limit',
+        )
+    
+    
+def hedge_delta_position(stock_id, options, futures, stock_value, hedge_cost, tick_size=0.1):
+    """
+    This is where the magic happes. the funtion computes the position needed to be hedged on the underlying asset.
+    This function (once finished) hedges the outstanding delta position by trading in the stock.
+    
+    That is:
+        - It calculates how sensitive the total position value is to changes in the underlying by summing up all
+          individual delta component.
+        - And then trades stocks which have the opposite exposure, to remain, roughly, flat delta exposure
+
+    Arguments:
+        stock_id: str         -  Exchange Instrument ID of the stock to hedge with
+        options: List[dict]   -  List of options with details to calculate and sum up delta positions for
+        futures: List[dict]   -  List of fetures with details to calculate and sum up delta positions for
+        stock_value: float    -  The stock value to assume when making delta calculations using Black-Scholes
+        
+    
+    """
+    # A2: Calculate the delta position here
+    positions = exchange.get_positions()
+    aggregrate_hedge_vol = 0
+    
+    #Hedging computation on futures and options
+    if options != None or futures != None:
+        for option_id, option in options.items(): #[Optimization: vactorise computation]
+            position = positions[option_id]
+            delta_option = calculate_option_delta(option.expiry, option.strike, option.option_kind, stock_value, 0.03, 3.0)
+            aggregrate_hedge_vol += position*delta_option
+            print(f"- The current position in option {option_id} is {position} with {delta_option:.3f} delta. Need to hedge {int(position*delta_option)}")
+            
+        print(f"- Aggregrated hedge volume pre-future :{int(aggregrate_hedge_vol)}")
+        
+        for future_id, future in futures.items():
+            position = positions[future_id]
+            delta_future = calculate_future_discount(future.expiry, future.interest_rate)
+            aggregrate_hedge_vol += position*delta_future
+            print(f"- The current position in future {future_id} is {position} with {delta_future:.3f} delta. Need to hedge {int(position*delta_future)}")
+        
+        print(f"- Aggregrated hedge volume post-future:{int(aggregrate_hedge_vol)}")
+    
+    # uncomment code below to also trade on illiquid stock
+    # Hedging computation for illiquid stock
+    aggregrate_hedge_vol += positions[stock_id+"_DUAL"]
+    dual_position = positions[stock_id+"_DUAL"]
+    print(f"- The current position in future {stock_id+'_DUAL'} is {dual_position} with 1 delta. Need to hedge {dual_position}.")
+    print(f"- Aggregrated hedge volume post-stock:{int(aggregrate_hedge_vol)}")
+    
+    stock_position = positions[stock_id]
+    print(f'- The current position in the stock {stock_id} is {stock_position}.')
+    
+    # A3: Implement the delta hedge here, staying mindful of the overall position-limit of 100, also for the stocks.
+    position_to_hedge = -stock_position - int(aggregrate_hedge_vol) #should round up down ?
+    print(f"- Lots to hedge {position_to_hedge} (negative means sell, positive means buy)")
+    
+    bid_volume, ask_volume = dynamic_limit_position(stock_id, abs(position_to_hedge))
+    
+    best_bid, best_ask = best_ask_bid_price(stock_id) 
+    if position_to_hedge >= 1 and bid_volume >= 1: #fractional position is not possible 
+        #bid for position_to_hedge
+        desire_ask_price = round_up_to_tick(stock_value, tick_size) #best_ask = best_ask_bid_price(stock_id, "ask") #fetch the most competetive price to buy in the market 
+        exchange.insert_order(
+            instrument_id=stock_id,
+            price=desire_ask_price + hedge_cost,
+            volume=bid_volume,
+            side='bid',
+            order_type='ioc',
+        ) #should add conditional to check if ioc trade is successfull
+        print(f'- Delta hedge order bid {bid_volume} lots on {stock_id} at a price > {desire_ask_price + hedge_cost:.3f} best ask is {best_ask:.3f}')
+        
+    elif position_to_hedge <= -1 and ask_volume >= 1:
+        #ask (sell) for position_to_hedge lot
+        desire_bid_price = round_down_to_tick(stock_value, tick_size) #may or may not fetch the price   #best_bid = best_ask_bid_price(stock_id, "bid")  #fetch the most competetive price to sell in the market
+        exchange.insert_order(
+            instrument_id=stock_id,
+            price=desire_bid_price - hedge_cost,
+            volume=ask_volume,
+            side='ask',
+            order_type='ioc',
+        ) #should add conditional to check if ioc trade is successfull
+        print(f'- Delta hedge order ask {ask_volume} lots on {stock_id} at a price < {desire_bid_price - hedge_cost:.3f} best bid is {best_bid:.3f}')
+        
+    else:
+        #do nothing position 
+        print(f'- Delta hedge constant or {stock_id} position is max out. Doing nothing.')
+
+
+def load_instruments_for_underlying(underlying_stock_id):
+    all_instruments = exchange.get_instruments()
+    stock = all_instruments[underlying_stock_id]
+    options = {instrument_id: instrument
+               for instrument_id, instrument in all_instruments.items()
+               if instrument.instrument_type == InstrumentType.STOCK_OPTION
+               and instrument.base_instrument_id == underlying_stock_id}
+    futures = {instrument_id: instrument
+               for instrument_id, instrument in all_instruments.items()
+               if instrument.instrument_type == InstrumentType.STOCK_FUTURE
+               and instrument.base_instrument_id == underlying_stock_id}
+               
+    return stock, options, futures
+
+def change_elapsed_dt_to_minutes(elapsed_time):
+    seconds = elapsed_time.total_seconds()
+    minutes = (seconds % 3600) // 60 #minute conversion
+    seconds_int = seconds % 60
+    return minutes, seconds_int
+    
+    
+# ================================
+#   Algorithm Starts Here
+# ================================
+        
+# Load all instruments for use in the algorithm
+nvda        = 'NVDA'
+nvda_dual   = 'NVDA_DUAL'
+
+vol_trade_options = 60 #45
+vol_trade_futures = 45 #45
+vol_trade_stock = 35 #30
+
+stock_high_vol = 60  #60
+future_low_vol = 45  #45
+#to use dynamic vol (increase vol size if underlying stock is at capacity). Make sure to turn of offloading strategy. 
+#my observation seems that this technique yields higher pnl than offloading strategy.
+#can extend this idea to include futures too
+
+san = 'SAN'
+san_dual = 'SAN_DUAL'
+vol_san = 25 #10
+
+max_pos = 100
+
+offloading_threshold = 70 #200
+#set it above 100 to turn offloading strategy. 
+
+pillow = 0.1 #0.1
+#float value to control minimum spread from fair price for market making strategy. 
+#e.g if pillow=0.1 and fair_price=40: place bid 39.9 and ask 40.1 which leads to atleast 0.2 profit
+ 
+spread = 0.3 #0.2
+#float value to control how we define a liquid order book is. 
+#e.g if spread=2. A liquid order book: best bid 40 and best ask 42 (the distance between best bid and ask).
+
+max_hedge_cost = 0.2 #0.3
+#float value to control hedging cost.
+#sometimes we cant hedge at a desired price becuase underlying stock becomes illiquid due to other teams's hedging 
+#so this value provide a way to find a sweet spot between making losses through hedging and directional movement of traded instuments.
+
+interval = 15 #minutes
+
+stock, options, futures = load_instruments_for_underlying(nvda)
+
+#telegram update: prompt a text to my telegram if the algorithm runs into errors.
+chat_id = "6188162094" 
+TOKEN = "6041499064:AAFvfxp-BxCfR2fFO0eYSpB2qDNxebdPONw"
+message = "Algorithm Started"
+url = f"https://api.telegram.org/bot{TOKEN}/sendMessage?chat_id={chat_id}&text={message}"
+       
+# start = dt.datetime.now()
+# start_pnl = exchange.get_pnl()
+# requests.get(url)
+
+while True:
+    time_now = dt.datetime.now()
+    print(f'')
+    print(f'-----------------------------------------------------------------')
+    print(f'TRADE LOOP ITERATION ENTERED AT {str(dt.datetime.now()):18s} UTC.')
+    print(f'-----------------------------------------------------------------')
+    
+    # elapsed = time_now - start
+    # minutes, second_int = change_elapsed_dt_to_minutes(elapsed)
+    
+    # if minutes % interval == 0 and minutes > 0 and second_int < 9:
+    #     current_pnl = exchange.get_pnl()
+    #     pnl_message = f"{interval} minutes PnL : {round(current_pnl-start_pnl,2)}"
+    #     pnl_url = f"https://api.telegram.org/bot{TOKEN}/sendMessage?chat_id={chat_id}&text={pnl_message}"
+    #     requests.get(pnl_url)
+    #     start_pnl = current_pnl
+        
+    try:
+        # uncomment code below to traade on SAN (I do not suggest doing this cus SAN is not as liquid as NVDA)
+        
+        print(f'\nSANl Trade')
+        #vol_san =  dynamic_volume(STOCK_ID, 50, 30)
+        san_mid = get_midpoint_value_normal(san)
+        
+        if san_mid is None:
+            print('Empty stock order book on bid or ask-side, or both, unable to update option prices.')
+            time.sleep(1)
+            continue
+        
+        #print(f"Mid_value {san_mid} for {STOCK_ID}")
+        
+        update_quotes(option_id=san,
+                                theoretical_price=san_mid,
+                                volume=vol_san,
+                                pillow=pillow,
+                                direction = "both",
+                                position_limit=max_pos,
+                                tick_size=0.10)
+                                
+        print(f'\nSANl Dual Trade')
+        
+        san_dual_mid = get_midpoint_value_normal(san)
+        
+        if san_dual_mid is None:
+            print('Empty stock order book on bid or ask-side, or both, unable to update option prices.')
+            time.sleep(1)
+            continue
+        
+        #print(f"Mid_value {san_mid} for {STOCK_ID}")
+        
+        update_quotes(option_id=san_dual,
+                                theoretical_price=san_dual_mid,
+                                volume=vol_san,
+                                pillow=pillow,
+                                direction = "both",
+                                position_limit=max_pos,
+                                tick_size=0.10)
+                                
+                                
+        # hedge_delta_position(stock_id=STOCK_ID, 
+        #                      options=None, 
+        #                      futures=None, 
+        #                      stock_value=san_mid, 
+        #                      hedge_cost=max_hedge_cost, 
+        #                      tick_size=0.1)
+            
+        print(f'\nNVDA Trade')
+        stock_value = get_midpoint_value(nvda, spread) #get reference price. recursively fetching the data until a liquid midpoint is found.
+        
+        if stock_value is None:
+            print('Empty stock order book on bid or ask-side, or both, unable to update option prices.')
+            time.sleep(1)
+            continue
+
+        stock_position = exchange.get_positions()[nvda]
+        print(f"NVDA position: {stock_position}")
+        
+        # ================
+        # Offloading 
+        # ================
+        if stock_position > offloading_threshold:
+            direction = "buy"
+            print(f"only find buy (bid) opportunity in futures and stock to offload nvda position")
+        elif stock_position < -offloading_threshold:
+            direction = "sell"
+            print(f"only find sell (ask) opportunity in futures and stock to offload nvda position")
+        else: 
+            direction = "both"
+        
+        
+        vol_stock = dynamic_volume(stock_position, max_pos, stock_high_vol, vol_trade_stock)    
+        #vol_futures = dynamic_volume(stock_position, max_pos, future_low_vol, vol_trade_futures)   
+        
+        # ================
+        # Quoting Stock (Dual)
+        # ================
+        print(f"\nUpdating instrument {nvda_dual}")
+        update_quotes(option_id=nvda_dual,
+                      theoretical_price=stock_value,
+                      pillow=pillow,
+                      volume=vol_stock,
+                      direction = direction,
+                      position_limit=max_pos,
+                      tick_size=0.10)
+            
+        
+        # ================
+        # Quoting options
+        # ================
+        for option_id, option in options.items():
+            print(f"\nUpdating instrument {option_id}")
+    
+            theoretical_value = calculate_theoretical_option_value(expiry=option.expiry,
+                                                                  strike=option.strike,
+                                                                  option_kind=option.option_kind,
+                                                                  stock_value=stock_value,
+                                                                  interest_rate=0.03,
+                                                                  volatility=3.0)
+                                                                   
+            print(f"theoretical_value {theoretical_value} for {option_id} ")
+            # A1: Here we ask a fixed credit of 15cts, regardless of what the market circumstances are or which option
+            #  we're quoting. That can be improved. Can you think of something better?
+            # A4: Here we are inserting a volume of 3, only taking into account the position limit of 100 if we reach
+            #  it, are there better choices?
+            update_quotes(option_id=option_id,
+                          theoretical_price=theoretical_value,
+                          pillow=pillow,
+                          volume=vol_trade_options,
+                          direction="both",
+                          position_limit=max_pos,
+                          tick_size=0.10)
+    
+            # Wait 1/5th of a second to avoid breaching the exchange frequency limit
+            time.sleep(0.20)
+            
+        # ================
+        # Quoting futures
+        # ================
+            
+        for future_id, future in futures.items():
+            print(f"\nUpdating instrument {future_id}")
+            theoretical_value = calculate_theoretical_future_value(expiry=future.expiry,
+                                                                  stock_value=stock_value,
+                                                                  interest_rate=0.03)
+                                                                   
+            print(f"theoretical_value {theoretical_value} for {future_id} ")
+            update_quotes(option_id=future_id,
+                          theoretical_price=theoretical_value,
+                          pillow=pillow,
+                          volume=vol_trade_futures,
+                          direction= "both",
+                          position_limit=max_pos,
+                          tick_size=0.10)
+        
+        # ================
+        # Hedging portfolio
+        # ================
+        
+        print(f'\nHedging delta position')
+        hedge_delta_position(stock_id=nvda, 
+                             options=options, 
+                             futures=futures, 
+                             stock_value=stock_value, 
+                             hedge_cost= max_hedge_cost)
+        
+        print(f'\nSleeping for 5 seconds to let limit orders being executed.')
+        time.sleep(5) 
+    
+    except KeyboardInterrupt: # So we can safely stop loop through Ctrl+C
+        break
+    
+    except IndexError:
+        print('Skipping iteration....')
+        
+    except TypeError as error:
+        print(f'Skipping iteration.... just a {error}')
+        
+    except Exception as exception: 
+        print("Exception: {}".format(type(exception).__name__))
+        print("Exception message: {}".format(exception))
+        message = f"An error has occurred. \nException : {type(exception).__name__} \nException message: {exception} \nAlgorithm is down. Turn it back on!"
+        requests.get(url)
+        break
+        
+
+        
+    #notes 
+    # optimised parameter (based on my observations)
+    # pillow = 0.1 anything less than this can lead to self trade
+    # sleep 5 seconds
+    # not doing offloading (could be that offloading incurs more costs than profits)
+    # not trade san cus illiquid
+    # vol options & trades 40 and 45.
+    # no dynamic vol + no offloading (no risk management) = ok but not maximised
+    # default (dynamic vol + no offloading) = 
+    # dynamic vol + offloading(stock) =
+    # no hedge + low vol (prevent reaching limit too fast) = 
